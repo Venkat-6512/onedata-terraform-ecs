@@ -17,7 +17,6 @@ on:
           - apply
           - destroy
 
-# Required for OIDC token request
 permissions:
   id-token: write
   contents: read
@@ -29,17 +28,21 @@ env:
 jobs:
   # ─────────────────────────────────────────────
   # JOB 1: Terraform Plan
-  # Runs on every push and PR
+  # Runs on: push, PR, manual plan/apply
+  # Skips on: manual destroy
   # ─────────────────────────────────────────────
   terraform-plan:
     name: 📋 Terraform Plan
     runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'destroy')
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # OIDC — no static credentials needed
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -79,14 +82,18 @@ jobs:
 
       - name: Plan summary
         run: |
-          echo "## 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Terraform Plan — Resources to be CREATED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          tail -30 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          cat plan-output.txt >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Review the above before approving the apply job**" >> $GITHUB_STEP_SUMMARY
 
   # ─────────────────────────────────────────────
   # JOB 2: Terraform Apply
-  # Only on push to main — pauses for approval
+  # Runs AFTER plan — requires manual approval
+  # Runs on: push to main only
   # ─────────────────────────────────────────────
   terraform-apply:
     name: 🚀 Terraform Apply
@@ -94,7 +101,7 @@ jobs:
     needs: terraform-plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
-      name: staging
+      name: staging     # ← manual approval gate
 
     steps:
       - name: Checkout code
@@ -123,6 +130,7 @@ jobs:
         with:
           name: terraform-plan
 
+      # Uses the saved plan — no drift between plan and apply
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
 
@@ -132,7 +140,6 @@ jobs:
           ALB_DNS=$(terraform output -raw alb_dns_name)
           echo "**ALB DNS:** \`${ALB_DNS}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Test URL:** http://${ALB_DNS}/health" >> $GITHUB_STEP_SUMMARY
-          echo ""
           echo "ALB DNS: ${ALB_DNS}"
 
       - name: Smoke test — curl ALB
@@ -152,15 +159,72 @@ jobs:
           done
 
   # ─────────────────────────────────────────────
-  # JOB 3: Terraform Destroy
-  # Manual trigger only — prevents accidental destroy
+  # JOB 3: Terraform Destroy Plan
+  # Shows exactly what will be destroyed BEFORE destroying
+  # Runs on: manual destroy trigger only
+  # ─────────────────────────────────────────────
+  terraform-destroy-plan:
+    name: 🔍 Destroy Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-TerraformDestroyPlan
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      # -destroy flag generates a plan showing what will be deleted
+      - name: Terraform Destroy Plan
+        run: terraform plan -destroy -out=destroy-plan -no-color 2>&1 | tee destroy-plan-output.txt
+
+      - name: Upload destroy plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-destroy-plan
+          path: |
+            destroy-plan
+            destroy-plan-output.txt
+          retention-days: 1
+
+      - name: Destroy plan summary
+        run: |
+          echo "## 🔍 Terraform Destroy Plan — Resources to be DELETED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat destroy-plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Review the above carefully before approving destroy**" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Terraform Destroy
+  # Runs AFTER destroy plan — requires manual approval
+  # Uses saved destroy plan — no surprises
   # ─────────────────────────────────────────────
   terraform-destroy:
     name: 💥 Terraform Destroy
     runs-on: ubuntu-latest
+    needs: terraform-destroy-plan
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
     environment:
-      name: staging
+      name: staging     # ← manual approval gate
 
     steps:
       - name: Checkout code
@@ -173,6 +237,9 @@ jobs:
           role-session-name: GitHubActions-TerraformDestroy
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -181,10 +248,16 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      - name: Download destroy plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-destroy-plan
+
+      # Uses the saved destroy plan — exactly what was reviewed
       - name: Terraform Destroy
-        run: terraform destroy -auto-approve
+        run: terraform apply -auto-approve destroy-plan
 
       - name: Destroy complete
         run: |
           echo "## 💥 Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
-          echo "All AWS resources have been removed. Billing stopped." >> $GITHUB_STEP_SUMMARY
+          echo "All AWS resources removed. Billing stopped." >> $GITHUB_STEP_SUMMARY
