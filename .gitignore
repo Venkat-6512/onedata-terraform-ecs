@@ -1,0 +1,23 @@
+# Terraform working directory — NEVER commit this
+.terraform/
+.terraform.lock.hcl
+
+# State files — NEVER commit these (contain secrets)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Plan files
+*.tfplan
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+
+# macOS
+.DS_Store
