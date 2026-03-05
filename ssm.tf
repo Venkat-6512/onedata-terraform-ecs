@@ -8,7 +8,7 @@ resource "aws_ssm_parameter" "container_image_uri" {
   name        = "/${var.project_name}/container-image-uri"
   description = "Container image URI for ECS task — updated by CI/CD pipeline"
   type        = "String"
-  value       = "ghcr.io/venkat-6512/onedata-devops-api:latest"
+  value       = "ghcr.io/venkat-6512/onedata-devops-api:a5fc4274"
 
   lifecycle {
     # CI/CD pipeline owns this value after initial creation
